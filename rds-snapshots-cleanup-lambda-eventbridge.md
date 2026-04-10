@@ -1,6 +1,6 @@
 This is continue with previous,.......
 
-*To impliment automating the process (using Lambda + EventBridge) to sweep and delete expired manual snapshots on a daily schedule.*
+*To impliment automating the process using (**Lambda + EventBridge**) to sweep and delete expired manual snapshots on a daily schedule.*
 # 🚀 What we are building
 
 ```text
