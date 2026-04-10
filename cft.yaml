@@ -1,0 +1,131 @@
+# Deploying the resources using cloudformation stack also using the SNS topic and cloudwatch.
+AWSTemplateFormatVersion: '2010-09-09'
+Description: RDS Manual Snapshot Cleanup with SNS Alert - Dev Environment
+
+Parameters:
+  SNSTopicArn:
+    Type: String
+    Description: Existing SNS Topic ARN for notifications
+
+Resources:
+
+  CleanupLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: rds-snapshot-cleanup-role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: rds-cleanup-policy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - rds:DescribeDBSnapshots
+                  - rds:ListTagsForResource
+                  - rds:DeleteDBSnapshot
+                Resource: "*"
+              - Effect: Allow
+                Action:
+                  - sns:Publish
+                Resource: !Ref SNSTopicArn
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: "*"
+
+  CleanupLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: rds-snapshot-cleanup-fn
+      Runtime: python3.12
+      Handler: index.lambda_handler
+      Role: !GetAtt CleanupLambdaRole.Arn
+      Timeout: 60
+      Environment:
+        Variables:
+          SNS_TOPIC_ARN: !Ref SNSTopicArn
+      Code:
+        ZipFile: |
+          import boto3
+          import os
+          from datetime import datetime, timezone
+
+          rds = boto3.client('rds')
+          sns = boto3.client('sns')
+
+          SNS_TOPIC_ARN = os.environ['SNS_TOPIC_ARN']
+
+          def lambda_handler(event, context):
+              snapshots = rds.describe_db_snapshots(SnapshotType='manual')['DBSnapshots']
+              today = datetime.now(timezone.utc).date()
+
+              for snap in snapshots:
+                  snapshot_id = snap['DBSnapshotIdentifier']
+                  db_id = snap['DBInstanceIdentifier']
+                  arn = snap['DBSnapshotArn']
+
+                  tags = rds.list_tags_for_resource(ResourceName=arn)['TagList']
+                  tag_dict = {t['Key']: t['Value'] for t in tags}
+
+                  expiry = tag_dict.get('ExpiryDate')
+
+                  if not expiry:
+                      print(f"Skipping {snapshot_id} (No ExpiryDate tag)")
+                      continue
+
+                  try:
+                      expiry_date = datetime.strptime(expiry, "%Y-%m-%d").date()
+                  except Exception:
+                      print(f"Invalid ExpiryDate format for {snapshot_id}: {expiry}")
+                      continue
+
+                  if expiry_date < today:
+
+                      message = (
+                          "RDS Snapshot Expiry Alert\n\n"
+                          + f"Snapshot ID: {snapshot_id}\n"
+                          + f"Database ID: {db_id}\n"
+                          + f"Expiry Date: {expiry}\n\n"
+                          + "Action: This snapshot is expired and will be deleted now."
+                      )
+
+                      sns.publish(
+                          TopicArn=SNS_TOPIC_ARN,
+                          Subject="RDS Snapshot Deletion Alert",
+                          Message=message
+                      )
+
+                      print(f"Alert sent for {snapshot_id}")
+
+                      try:
+                          rds.delete_db_snapshot(DBSnapshotIdentifier=snapshot_id)
+                          print(f"Deleted snapshot: {snapshot_id}")
+                      except Exception as e:
+                          print(f"Error deleting {snapshot_id}: {str(e)}")
+
+  CleanupSchedule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: rds-cleanup-daily
+      ScheduleExpression: rate(1 day)
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt CleanupLambda.Arn
+          Id: LambdaTarget
+
+  LambdaInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref CleanupLambda
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt CleanupSchedule.Arn
